@@ -1,8 +1,8 @@
 /*!
  * Copyright 2014-2019 by Contributors
- * \file updater_colmaker.cc
- * \brief use columnwise update to construct a tree
- * \author Tianqi Chen
+ * \file updater_path_colmaker.cc
+ * \brief use columnwise update to construct a path
+ * \author Tianqi Chen, Yizheng Chen
  */
 #include <rabit/rabit.h>
 #include <memory>
@@ -22,12 +22,12 @@
 namespace xgboost {
 namespace tree {
 
-DMLC_REGISTRY_FILE_TAG(updater_colmaker);
+DMLC_REGISTRY_FILE_TAG(updater_path_colmaker);
 
-struct ColMakerTrainParam : XGBoostParameter<ColMakerTrainParam> {
+struct PathColMakerTrainParam : XGBoostParameter<PathColMakerTrainParam> {
   // speed optimization for dense column
   float opt_dense_col;
-  DMLC_DECLARE_PARAMETER(ColMakerTrainParam) {
+  DMLC_DECLARE_PARAMETER(PathColMakerTrainParam) {
     DMLC_DECLARE_FIELD(opt_dense_col)
         .set_range(0.0f, 1.0f)
         .set_default(1.0f)
@@ -47,10 +47,10 @@ struct ColMakerTrainParam : XGBoostParameter<ColMakerTrainParam> {
   }
 };
 
-DMLC_REGISTER_PARAMETER(ColMakerTrainParam);
+DMLC_REGISTER_PARAMETER(PathColMakerTrainParam);
 
-/*! \brief column-wise update to construct a tree */
-class ColMaker: public TreeUpdater {
+/*! \brief column-wise update to construct a path */
+class PathColMaker: public TreeUpdater {
  public:
   void Configure(const Args& args) override {
     param_.UpdateAllowUnknown(args);
@@ -69,7 +69,7 @@ class ColMaker: public TreeUpdater {
   }
 
   char const* Name() const override {
-    return "grow_colmaker";
+    return "grow_path_colmaker";
   }
 
   void LazyGetColumnDensity(DMatrix *dmat) {
@@ -95,7 +95,7 @@ class ColMaker: public TreeUpdater {
               DMatrix* dmat,
               const std::vector<RegTree*> &trees) override {
     if (rabit::IsDistributed()) {
-      LOG(FATAL) << "Updater `grow_colmaker` or `exact` tree method doesn't "
+      LOG(FATAL) << "Updater `grow_path_colmaker` or `path` tree method doesn't "
                     "support distributed training.";
     }
     this->LazyGetColumnDensity(dmat);
@@ -117,7 +117,7 @@ class ColMaker: public TreeUpdater {
  protected:
   // training parameter
   TrainParam param_;
-  ColMakerTrainParam colmaker_param_;
+  PathColMakerTrainParam colmaker_param_;
   // SplitEvaluator that will be cloned for each Builder
   std::vector<float> column_densities_;
 
@@ -131,6 +131,8 @@ class ColMaker: public TreeUpdater {
     bst_float last_fvalue { 0 };
     /*! \brief current best solution */
     SplitEntry best;
+    /*! \brief whether to go left path */
+    bool left_path;
     // constructor
     ThreadEntry() = default;
   };
@@ -143,6 +145,8 @@ class ColMaker: public TreeUpdater {
     bst_float weight { 0.0f };
     /*! \brief current best solution */
     SplitEntry best;
+    /*! \brief whether to go left path */
+    bool left_path;
     // constructor
     NodeEntry() = default;
   };
@@ -151,7 +155,7 @@ class ColMaker: public TreeUpdater {
    public:
     // constructor
     explicit Builder(const TrainParam& param,
-                     const ColMakerTrainParam& colmaker_train_param,
+                     const PathColMakerTrainParam& colmaker_train_param,
                      FeatureInteractionConstraintHost _interaction_constraints,
                      const std::vector<float> &column_densities)
         : param_(param), colmaker_train_param_{colmaker_train_param},
@@ -320,30 +324,60 @@ class ColMaker: public TreeUpdater {
             e.stats.sum_hess >= param_.min_child_weight) {
           c.SetSubstract(snode_[nid].stats, e.stats);
           if (c.sum_hess >= param_.min_child_weight) {
+            bool take_left;
+            bool updated;
             bst_float loss_chg {0};
+            bst_float left_loss_chg {0};
+            bst_float right_loss_chg {0};
             if (d_step == -1) {
-              loss_chg = static_cast<bst_float>(
-                  evaluator.CalcSplitGain(param_, nid, fid, c, e.stats) -
+              left_loss_chg = static_cast<bst_float>(
+                  evaluator.CalcPathGain(param_, nid, fid, c) -
                   snode_[nid].root_gain);
+              right_loss_chg = static_cast<bst_float>(
+                  evaluator.CalcPathGain(param_, nid, fid, e.stats) -
+                  snode_[nid].root_gain);
+              if (left_loss_chg >= right_loss_chg) {
+                loss_chg = left_loss_chg;
+                take_left = true;
+              } else {
+                loss_chg = right_loss_chg;
+                take_left = false;
+              }
               bst_float proposed_split = (fvalue + e.last_fvalue) * 0.5f;
               if ( proposed_split == fvalue ) {
-                e.best.Update(loss_chg, fid, e.last_fvalue,
+                updated = e.best.Update(loss_chg, fid, e.last_fvalue,
                               d_step == -1, c, e.stats);
               } else {
-                e.best.Update(loss_chg, fid, proposed_split,
+                updated = e.best.Update(loss_chg, fid, proposed_split,
                               d_step == -1, c, e.stats);
               }
+              if (updated) {
+                e.left_path = take_left;
+              }
             } else {
-              loss_chg = static_cast<bst_float>(
-                  evaluator.CalcSplitGain(param_, nid, fid, e.stats, c) -
+              left_loss_chg = static_cast<bst_float>(
+                  evaluator.CalcPathGain(param_, nid, fid, e.stats) -
                   snode_[nid].root_gain);
+              right_loss_chg = static_cast<bst_float>(
+                  evaluator.CalcPathGain(param_, nid, fid, c) -
+                  snode_[nid].root_gain);
+              if (left_loss_chg >= right_loss_chg) {
+                loss_chg = left_loss_chg;
+                take_left = true;
+              } else {
+                loss_chg = right_loss_chg;
+                take_left = false;
+              }
               bst_float proposed_split = (fvalue + e.last_fvalue) * 0.5f;
               if ( proposed_split == fvalue ) {
-                e.best.Update(loss_chg, fid, e.last_fvalue,
+                updated = e.best.Update(loss_chg, fid, e.last_fvalue,
                             d_step == -1, e.stats, c);
               } else {
-                e.best.Update(loss_chg, fid, proposed_split,
+                updated = e.best.Update(loss_chg, fid, proposed_split,
                             d_step == -1, e.stats, c);
+              }
+              if (updated) {
+                e.left_path = take_left;
               }
             }
           }
@@ -415,21 +449,51 @@ class ColMaker: public TreeUpdater {
         c.SetSubstract(snode_[nid].stats, e.stats);
         if (e.stats.sum_hess >= param_.min_child_weight &&
             c.sum_hess >= param_.min_child_weight) {
-          bst_float loss_chg;
+          bool take_left;
+          bool updated;
+          bst_float loss_chg {0};
+          bst_float left_loss_chg {0};
+          bst_float right_loss_chg {0};
           const bst_float gap = std::abs(e.last_fvalue) + kRtEps;
           const bst_float delta = d_step == +1 ? gap: -gap;
           if (d_step == -1) {
-            loss_chg = static_cast<bst_float>(
-                evaluator.CalcSplitGain(param_, nid, fid, c, e.stats) -
+            left_loss_chg = static_cast<bst_float>(
+                evaluator.CalcPathGain(param_, nid, fid, c) -
                 snode_[nid].root_gain);
-            e.best.Update(loss_chg, fid, e.last_fvalue + delta, d_step == -1, c,
+            right_loss_chg = static_cast<bst_float>(
+                evaluator.CalcPathGain(param_, nid, fid, e.stats) -
+                snode_[nid].root_gain);
+            if (left_loss_chg >= right_loss_chg) {
+              loss_chg = left_loss_chg;
+              take_left = true;
+            } else {
+              loss_chg = right_loss_chg;
+              take_left = false;
+            }
+            updated = e.best.Update(loss_chg, fid, e.last_fvalue + delta, d_step == -1, c,
                           e.stats);
+            if (updated) {
+              e.left_path = take_left;
+            }
           } else {
-            loss_chg = static_cast<bst_float>(
-                evaluator.CalcSplitGain(param_, nid, fid, e.stats, c) -
+            left_loss_chg = static_cast<bst_float>(
+                evaluator.CalcPathGain(param_, nid, fid, e.stats) -
                 snode_[nid].root_gain);
-            e.best.Update(loss_chg, fid, e.last_fvalue + delta, d_step == -1,
+            right_loss_chg = static_cast<bst_float>(
+                evaluator.CalcPathGain(param_, nid, fid, c) -
+                snode_[nid].root_gain);
+            if (left_loss_chg >= right_loss_chg) {
+              loss_chg = left_loss_chg;
+              take_left = true;
+            } else {
+              loss_chg = right_loss_chg;
+              take_left = false;
+            }
+            updated = e.best.Update(loss_chg, fid, e.last_fvalue + delta, d_step == -1,
                           e.stats, c);
+            if (updated) {
+              e.left_path = take_left;
+            }
           }
         }
       }
@@ -492,17 +556,25 @@ class ColMaker: public TreeUpdater {
         NodeEntry const &e = snode_[nid];
         // now we know the solution in snode[nid], set split
         if (e.best.loss_chg > kRtEps) {
-          bst_float left_leaf_weight =
+          bst_float left_leaf_weight;
+          bst_float right_leaf_weight;
+          if (e.left_path) {
+            left_leaf_weight =
               evaluator.CalcWeight(nid, param_, e.best.left_sum) *
               param_.learning_rate;
-          bst_float right_leaf_weight =
+            right_leaf_weight = 0.0f;
+          } else {
+            left_leaf_weight = 0.0f;
+            right_leaf_weight =
               evaluator.CalcWeight(nid, param_, e.best.right_sum) *
               param_.learning_rate;
-          p_tree->ExpandNode(nid, e.best.SplitIndex(), e.best.split_value,
+          }
+          p_tree->ExpandPath(nid, e.best.SplitIndex(), e.best.split_value,
                              e.best.DefaultLeft(), e.weight, left_leaf_weight,
                              right_leaf_weight, e.best.loss_chg,
                              e.stats.sum_hess,
                              e.best.left_sum.GetHess(), e.best.right_sum.GetHess(),
+                             e.left_path,
                              0);
         } else {
           (*p_tree)[nid].SetLeaf(e.weight * param_.learning_rate);
@@ -547,7 +619,9 @@ class ColMaker: public TreeUpdater {
       for (int nid : qexpand) {
         NodeEntry &e = snode_[nid];
         for (int tid = 0; tid < this->nthread_; ++tid) {
-          e.best.Update(stemp_[tid][nid].best);
+          if (e.best.Update(stemp_[tid][nid].best)) {
+            e.left_path = stemp_[tid][nid].left_path;
+          }
         }
       }
     }
@@ -601,7 +675,7 @@ class ColMaker: public TreeUpdater {
     }
     //  --data fields--
     const TrainParam& param_;
-    const ColMakerTrainParam& colmaker_train_param_;
+    const PathColMakerTrainParam& colmaker_train_param_;
     // number of omp thread used during training
     const int nthread_;
     common::ColumnSampler column_sampler_;
@@ -620,10 +694,10 @@ class ColMaker: public TreeUpdater {
   };
 };
 
-XGBOOST_REGISTER_TREE_UPDATER(ColMaker, "grow_colmaker")
-.describe("Grow tree with parallelization over columns.")
+XGBOOST_REGISTER_TREE_UPDATER(ColMaker, "grow_path_colmaker")
+.describe("Grow path with parallelization over columns.")
 .set_body([]() {
-    return new ColMaker();
+    return new PathColMaker();
   });
 }  // namespace tree
 }  // namespace xgboost

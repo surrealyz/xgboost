@@ -90,6 +90,15 @@ class TreeEvaluator {
       }
     }
 
+    XGBOOST_DEVICE double CalcPathGain(const ParamT &param, bst_node_t nidx,
+                                        bst_feature_t fidx,
+                                        tree::GradStats const& left) const {
+      // can be called for both the left side and the right side
+      double wleft = this->CalcWeight(nidx, param, left);
+      double gain = this->CalcGainGivenWeight(param, left, wleft);
+      return gain;
+    }
+
     XGBOOST_DEVICE float CalcWeight(bst_node_t nodeid, const ParamT &param,
                                     tree::GradStats const& stats) const {
       float w = xgboost::tree::CalcWeight(param, stats);

@@ -696,6 +696,39 @@ void RegTree::ExpandNode(bst_node_t nid, unsigned split_index, bst_float split_v
   this->split_types_.at(nid) = FeatureType::kNumerical;
 }
 
+void RegTree::ExpandPath(bst_node_t nid, unsigned split_index, bst_float split_value,
+                         bool default_left, bst_float base_weight,
+                         bst_float left_leaf_weight,
+                         bst_float right_leaf_weight, bst_float loss_change,
+                         float sum_hess, float left_sum, float right_sum,
+                         bool left_path,
+                         bst_node_t leaf_right_child) {
+  int pleft = this->AllocNode();
+  int pright = this->AllocNode();
+  auto &node = nodes_[nid];
+  CHECK(node.IsLeaf());
+  node.SetLeftChild(pleft);
+  node.SetRightChild(pright);
+  nodes_[node.LeftChild()].SetParent(nid, true);
+  nodes_[node.RightChild()].SetParent(nid, false);
+  node.SetSplit(split_index, split_value, default_left);
+
+  nodes_[pleft].SetLeaf(left_leaf_weight, leaf_right_child);
+  nodes_[pright].SetLeaf(right_leaf_weight, leaf_right_child);
+
+  this->Stat(nid) = {loss_change, sum_hess, base_weight};
+  this->Stat(pleft) = {0.0f, left_sum, left_leaf_weight};
+  this->Stat(pright) = {0.0f, right_sum, right_leaf_weight};
+
+  if (left_path) {
+    nodes_[pleft].SetLeaf(0.0f);
+  } else {
+    nodes_[pright].SetLeaf(0.0f);
+  }
+  this->split_types_.at(nid) = FeatureType::kNumerical;
+}
+
+
 void RegTree::ExpandCategorical(bst_node_t nid, unsigned split_index,
                                 common::Span<uint32_t> split_cat, bool default_left,
                                 bst_float base_weight,
